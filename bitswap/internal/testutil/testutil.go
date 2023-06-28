@@ -21,7 +21,7 @@ func GenerateBlocksOfSize(n int, size int64) []blocks.Block {
 	for i := 0; i < n; i++ {
 		// rand.Read never errors
 		buf := make([]byte, size)
-		rand.Read(buf)
+		_, _ = rand.Read(buf)
 		b := blocks.NewBlock(buf)
 		generatedBlocks = append(generatedBlocks, b)
 

@@ -1709,7 +1709,7 @@ func TestIgnoresCidsAboveLimit(t *testing.T) {
 	hash = binary.AppendUvarint(hash, cidLimit)
 	startOfDigest := len(hash)
 	hash = append(hash, make(mh.Multihash, cidLimit)...)
-	rand.Read(hash[startOfDigest:])
+	_, _ = rand.Read(hash[startOfDigest:])
 	m.AddEntry(cid.NewCidV1(cid.Raw, hash), 0, pb.Message_Wantlist_Block, true)
 
 	warsaw.Engine.MessageReceived(ctx, riga.Peer, m)
@@ -1746,7 +1746,7 @@ func TestKillConnectionForInlineCid(t *testing.T) {
 	hash = binary.AppendUvarint(hash, digestSize)
 	startOfDigest := len(hash)
 	hash = append(hash, make(mh.Multihash, digestSize)...)
-	rand.Read(hash[startOfDigest:])
+	_, _ = rand.Read(hash[startOfDigest:])
 	m.AddEntry(cid.NewCidV1(cid.Raw, hash), 0, pb.Message_Wantlist_Block, true)
 
 	if !warsaw.Engine.MessageReceived(ctx, riga.Peer, m) {

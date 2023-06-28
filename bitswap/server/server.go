@@ -210,6 +210,20 @@ func MaxOutstandingBytesPerPeer(count int) Option {
 	}
 }
 
+func WithPSI(psi bool) Option {
+	o := decision.WithPSI(psi)
+	return func(bs *Server) {
+		bs.engineOptions = append(bs.engineOptions, o)
+	}
+}
+
+func WithFilter(filter bool) Option {
+	o := decision.WithFilter(filter)
+	return func(bs *Server) {
+		bs.engineOptions = append(bs.engineOptions, o)
+	}
+}
+
 // MaxQueuedWantlistEntriesPerPeer limits how much individual entries each peer is allowed to send.
 // If a peer send us more than this we will truncate newest entries.
 // It defaults to defaults.MaxQueuedWantlistEntiresPerPeer.
@@ -552,6 +566,10 @@ func (bs *Server) PeerConnected(p peer.ID) {
 }
 func (bs *Server) PeerDisconnected(p peer.ID) {
 	bs.engine.PeerDisconnected(p)
+}
+
+func (bs *Server) ClearHaves() {
+	bs.engine.ClearHaves()
 }
 
 // Close is called to shutdown the Client

@@ -71,6 +71,14 @@ func ProviderSearchDelay(newProvSearchDelay time.Duration) Option {
 	return Option{client.ProviderSearchDelay(newProvSearchDelay)}
 }
 
+func WithPSI(psi bool) Option {
+	return Option{server.WithPSI(psi)}
+}
+
+func WithFilter(filter bool) Option {
+	return Option{server.WithFilter(filter)}
+}
+
 func RebroadcastDelay(newRebroadcastDelay delay.D) Option {
 	return Option{client.RebroadcastDelay(newRebroadcastDelay)}
 }

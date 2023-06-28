@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/circl/group"
 	"github.com/google/uuid"
 
 	wl "github.com/ipfs/boxo/bitswap/client/wantlist"
@@ -15,6 +16,7 @@ import (
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	pb "github.com/ipfs/boxo/bitswap/message/pb"
 	bmetrics "github.com/ipfs/boxo/bitswap/metrics"
+	"github.com/ipfs/boxo/bitswap/psiUtil"
 	bstore "github.com/ipfs/boxo/blockstore"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -143,6 +145,10 @@ type Engine struct {
 
 	bsm *blockstoreManager
 
+	psi    bool
+	filter bool
+	su     psiUtil.ServerUtil
+
 	peerTagger PeerTagger
 
 	tagQueued, tagUseful string
@@ -237,6 +243,18 @@ func WithTargetMessageSize(size int) Option {
 func WithScoreLedger(scoreledger ScoreLedger) Option {
 	return func(e *Engine) {
 		e.scoreLedger = scoreledger
+	}
+}
+
+func WithPSI(psi bool) Option {
+	return func(e *Engine) {
+		e.psi = psi
+	}
+}
+
+func WithFilter(filter bool) Option {
+	return func(e *Engine) {
+		e.filter = filter
 	}
 }
 
@@ -373,6 +391,24 @@ func newEngine(
 		opt(e)
 	}
 
+	var su psiUtil.ServerUtil
+	var err error
+	if e.psi {
+		su, err = psiUtil.NewServerPsiUtil(group.Ristretto255)
+		if err != nil {
+			log.Debugf("Failed to initialize PSIUtility")
+			panic(err)
+		}
+		log.Info("PSI-Swap")
+	} else if e.filter {
+		su = psiUtil.NewServerFilterUtil()
+		log.Info("Bloom-Swap")
+	} else {
+		su = &psiUtil.DefaultUtil{}
+		log.Info("Vanilla-Swap")
+	}
+	e.su = su
+
 	e.bsm = newBlockstoreManager(bs, e.bstoreWorkerCount, bmetrics.PendingBlocksGauge(ctx), bmetrics.ActiveBlocksGauge(ctx))
 
 	// default peer task queue options
@@ -406,6 +442,10 @@ func (e *Engine) updateMetrics() {
 		e.activeGauge.Set(float64(stats.NumActive))
 		e.pendingGauge.Set(float64(stats.NumPending))
 	}
+}
+
+func (e *Engine) ClearHaves() {
+	e.su.ClearHaves()
 }
 
 // SetSendDontHaves indicates what to do when the engine receives a want-block
@@ -687,6 +727,9 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 	}
 
 	filteredWants := wants[:0] // shift inplace
+	var psi []bsmsg.Entry
+	var sreq cid.Cid
+	var sreqprio int32
 
 	for _, entry := range wants {
 		if entry.Cid.Prefix().MhType == mh.IDENTITY {
@@ -699,9 +742,20 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 			// Ignore requests about CIDs that big.
 			continue
 		}
+		codec := entry.Cid.Prefix().Codec
+		if !e.psi {
+			filteredWants = append(filteredWants, entry)
+		} else if codec == psiUtil.PsiCidCodec && entry.WantType == pb.Message_Wantlist_Have {
+			psi = append(psi, entry)
+		} else if codec == psiUtil.DummyCidCodecA || codec == psiUtil.DummyCidCodecF || codec == psiUtil.DummyCodecBF {
+			sreq = entry.Cid
+			sreqprio = entry.Priority
+		} else {
+			filteredWants = append(filteredWants, entry)
+		}
 
 		e.peerLedger.Wants(p, entry.Entry)
-		filteredWants = append(filteredWants, entry)
+
 	}
 	clear := wants[len(filteredWants):]
 	for i := range clear {
@@ -753,6 +807,39 @@ func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwap
 				},
 			})
 		}
+	}
+
+	// PSI answers
+	if sreq != cid.Undef {
+		keys, err := e.bsm.getallKeys()
+		if err != nil {
+			log.Infow("Could not retrieve stored block CIDs. %w", err)
+		}
+		log.Infof("U requested. %v blocks in Storage.", len(keys))
+		haves := e.su.TransformHaves(sreq.Prefix().Codec, keys)
+		for _, have := range haves {
+			newWorkExists = true
+			activeEntries = append(activeEntries, peertask.Task{
+				Topic:    have,
+				Priority: int(sreqprio),
+				Work:     bsmsg.BlockPresenceSize(have),
+				Data: &taskData{
+					BlockSize:    bsmsg.BlockPresenceSize(have),
+					HaveBlock:    true,
+					IsWantBlock:  false,
+					SendDontHave: false,
+				},
+			})
+		}
+	}
+	for _, entry := range psi {
+		newCID, err := e.su.TransformDontHave(entry.Cid)
+		if err != nil {
+			log.Infow("Skipping %v. %w", entry.Cid, err)
+		}
+		entry.Cid = newCID
+		sendDontHave(entry)
+		e.peerLedger.CancelWant(p, entry.Cid)
 	}
 
 	// Deny access to blocks

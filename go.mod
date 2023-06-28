@@ -6,9 +6,11 @@ require (
 	github.com/alecthomas/units v0.0.0-20210927113745-59d0afb8317a
 	github.com/benbjohnson/clock v1.3.0
 	github.com/cespare/xxhash/v2 v2.2.0
+	github.com/cloudflare/circl v1.3.3
 	github.com/crackcomm/go-gitignore v0.0.0-20170627025303-887ab5e44cc3
 	github.com/cskr/pubsub v1.0.2
 	github.com/dustin/go-humanize v1.0.0
+	github.com/epikd/psiMagic v0.0.0-20221006063744-5fca643727cb
 	github.com/gabriel-vasile/mimetype v1.4.1
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/uuid v1.3.0
@@ -27,6 +29,7 @@ require (
 	github.com/ipfs/go-ipld-cbor v0.0.6
 	github.com/ipfs/go-ipld-format v0.5.0
 	github.com/ipfs/go-ipld-legacy v0.2.1
+	github.com/ipfs/go-log v1.0.5
 	github.com/ipfs/go-log/v2 v2.5.1
 	github.com/ipfs/go-metrics-interface v0.0.1
 	github.com/ipfs/go-peertaskqueue v0.8.1
@@ -83,6 +86,7 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bwesterb/go-ristretto v1.2.3 // indirect
 	github.com/cenkalti/backoff/v4 v4.2.0 // indirect
 	github.com/containerd/cgroups v1.0.4 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
@@ -112,7 +116,6 @@ require (
 	github.com/ipfs/go-ipfs-ds-help v1.1.0 // indirect
 	github.com/ipfs/go-ipfs-pq v0.0.3 // indirect
 	github.com/ipfs/go-ipfs-util v0.0.2 // indirect
-	github.com/ipfs/go-log v1.0.5 // indirect
 	github.com/ipfs/go-unixfs v0.4.5 // indirect
 	github.com/ipld/go-car/v2 v2.9.1-0.20230325062757-fff0e4397a3d // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
