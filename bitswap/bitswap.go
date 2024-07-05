@@ -11,6 +11,7 @@ import (
 	"github.com/ipfs/boxo/bitswap/server"
 	"github.com/ipfs/boxo/bitswap/tracer"
 	"github.com/ipfs/go-metrics-interface"
+	"github.com/katzenpost/hpqc/nike"
 
 	blockstore "github.com/ipfs/boxo/blockstore"
 	exchange "github.com/ipfs/boxo/exchange"
@@ -180,4 +181,24 @@ func (bs *Bitswap) ReceiveMessage(ctx context.Context, p peer.ID, incoming messa
 
 	bs.Client.ReceiveMessage(ctx, p, incoming)
 	bs.Server.ReceiveMessage(ctx, p, incoming)
+}
+
+func (bs *Bitswap) UpdatePubKeys(keys map[peer.ID]nike.PublicKey) {
+	bs.net.UpdatePubKeys(keys)
+}
+
+func (bs *Bitswap) GetNikeKey() nike.PublicKey {
+	return bs.net.GetNikeKey()
+}
+
+func (bs *Bitswap) SetNikeKey(priv nike.PrivateKey, pub nike.PublicKey) {
+	bs.net.SetNikeKey(priv, pub)
+}
+
+func (bs *Bitswap) Scheme() nike.Scheme {
+	return bs.net.Scheme()
+}
+
+func (bs *Bitswap) SetHops(hops int) {
+	bs.net.SetHops(hops)
 }

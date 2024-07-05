@@ -6,6 +6,7 @@ import (
 
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	"github.com/ipfs/boxo/bitswap/network/internal"
+	"github.com/katzenpost/hpqc/nike"
 
 	cid "github.com/ipfs/go-cid"
 
@@ -23,6 +24,8 @@ var (
 	ProtocolBitswapOneOne = internal.ProtocolBitswapOneOne
 	// ProtocolBitswap is the current version of the bitswap protocol: 1.2.0
 	ProtocolBitswap = internal.ProtocolBitswap
+	// Understands Sphinx packet format, can forward and receive sphinx packets
+	ProtocolSphinx = internal.ProtocolSphinx
 )
 
 // BitSwapNetwork provides network connectivity for BitSwap sessions.
@@ -48,6 +51,12 @@ type BitSwapNetwork interface {
 	ConnectionManager() connmgr.ConnManager
 
 	Stats() Stats
+
+	UpdatePubKeys(map[peer.ID]nike.PublicKey)
+	GetNikeKey() nike.PublicKey
+	SetNikeKey(nike.PrivateKey, nike.PublicKey)
+	Scheme() nike.Scheme
+	SetHops(hops int)
 
 	Routing
 

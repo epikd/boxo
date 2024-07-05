@@ -2,6 +2,7 @@ package bitswap
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"sort"
 	"sync"
@@ -10,6 +11,8 @@ import (
 
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
 	bsnet "github.com/ipfs/boxo/bitswap/network"
+	"github.com/katzenpost/hpqc/nike"
+	"github.com/katzenpost/hpqc/nike/x25519"
 
 	mockrouting "github.com/ipfs/boxo/routing/mock"
 	cid "github.com/ipfs/go-cid"
@@ -252,6 +255,19 @@ func (nc *networkClient) Stats() bsnet.Stats {
 		MessagesSent:  atomic.LoadUint64(&nc.stats.MessagesSent),
 	}
 }
+
+func (nc *networkClient) UpdatePubKeys(map[peer.ID]nike.PublicKey) {}
+func (nc *networkClient) GetNikeKey() nike.PublicKey {
+	sch := x25519.Scheme(rand.Reader)
+	return sch.NewEmptyPublicKey()
+}
+func (nc *networkClient) SetNikeKey(nike.PrivateKey, nike.PublicKey) {}
+func (nc *networkClient) Scheme() nike.Scheme {
+	scheme := x25519.Scheme(rand.Reader)
+	return scheme
+}
+
+func (nc *networkClient) SetHops(hops int) {}
 
 // FindProvidersAsync returns a channel of providers for the given key.
 func (nc *networkClient) FindProvidersAsync(ctx context.Context, k cid.Cid, max int) <-chan peer.ID {

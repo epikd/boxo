@@ -13,9 +13,12 @@ var (
 	ProtocolBitswapOneOne protocol.ID = "/ipfs/bitswap/1.1.0"
 	// ProtocolBitswap is the current version of the bitswap protocol: 1.2.0
 	ProtocolBitswap protocol.ID = "/ipfs/bitswap/1.2.0"
+	// ProtocolSphinx
+	ProtocolSphinx protocol.ID = "/ipfs/bitswap/sphinx"
 )
 
 var DefaultProtocols = []protocol.ID{
+	ProtocolSphinx,
 	ProtocolBitswap,
 	ProtocolBitswapOneOne,
 	ProtocolBitswapOneZero,

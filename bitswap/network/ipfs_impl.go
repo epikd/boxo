@@ -2,14 +2,19 @@ package network
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	bsmsg "github.com/ipfs/boxo/bitswap/message"
+	bitswap_message_pb "github.com/ipfs/boxo/bitswap/message/pb"
 	"github.com/ipfs/boxo/bitswap/network/internal"
+	blocks "github.com/ipfs/go-block-format"
 
 	cid "github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
@@ -24,6 +29,14 @@ import (
 	msgio "github.com/libp2p/go-msgio"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multistream"
+
+	pool "github.com/libp2p/go-buffer-pool"
+
+	"github.com/katzenpost/hpqc/nike"
+	"github.com/katzenpost/hpqc/nike/x25519"
+	kpsphinx "github.com/katzenpost/katzenpost/core/sphinx"
+	"github.com/katzenpost/katzenpost/core/sphinx/commands"
+	"github.com/katzenpost/katzenpost/core/sphinx/geo"
 )
 
 var log = logging.Logger("bitswap_network")
@@ -35,11 +48,24 @@ var (
 	minSendTimeout = 10 * time.Second
 	sendLatency    = 2 * time.Second
 	minSendRate    = (100 * 1000) / 8 // 100kbit/s
+
 )
 
 // NewFromIpfsHost returns a BitSwapNetwork supported by underlying IPFS host.
 func NewFromIpfsHost(host host.Host, r routing.ContentRouting, opts ...NetOpt) BitSwapNetwork {
 	s := processSettings(opts...)
+	nrHops := 2
+	scheme := x25519.Scheme(rand.Reader)
+	geom := geo.GeometryFromUserForwardPayloadLength(scheme, 512, true, nrHops)
+	sphinx := kpsphinx.NewNIKESphinx(scheme, geom)
+	surbmap := make(map[[16]byte][]byte)
+	surbdest := make(map[[16]byte]peer.ID)
+	serversurb := make(map[peer.ID][]byte)
+
+	pub, priv, err := scheme.GenerateKeyPair()
+	if err != nil {
+		log.Infof("Key generation error.")
+	}
 
 	bitswapNetwork := impl{
 		host:    host,
@@ -49,6 +75,15 @@ func NewFromIpfsHost(host host.Host, r routing.ContentRouting, opts ...NetOpt) B
 		protocolBitswapOneZero: s.ProtocolPrefix + ProtocolBitswapOneZero,
 		protocolBitswapOneOne:  s.ProtocolPrefix + ProtocolBitswapOneOne,
 		protocolBitswap:        s.ProtocolPrefix + ProtocolBitswap,
+		protocolSphinx:         s.ProtocolPrefix + ProtocolSphinx,
+		recsphinx:              sphinx,
+		surbmap:                surbmap,
+		surbdest:               surbdest,
+		serversurb:             serversurb,
+		scheme:                 scheme,
+		pubk:                   pub,
+		privk:                  priv,
+		nrHops:                 nrHops,
 
 		supportedProtocols: s.SupportedProtocols,
 	}
@@ -82,11 +117,32 @@ type impl struct {
 	protocolBitswapOneZero protocol.ID
 	protocolBitswapOneOne  protocol.ID
 	protocolBitswap        protocol.ID
+	protocolSphinx         protocol.ID
 
 	supportedProtocols []protocol.ID
 
 	// inbound messages from the network are forwarded to the receiver
 	receivers []Receiver
+
+	scheme    nike.Scheme
+	privk     nike.PrivateKey
+	pubk      nike.PublicKey
+	recsphinx *kpsphinx.Sphinx
+	nrHops    int
+
+	clientlk sync.RWMutex
+	serverlk sync.RWMutex
+
+	// NodeID - PID
+	nidpid map[[32]byte]peer.ID
+	keys   map[peer.ID]nike.PublicKey
+
+	// ID - decryptionkey
+	surbmap map[[16]byte][]byte
+	// ID - destination
+	surbdest map[[16]byte]peer.ID
+	// surbid - temp PID
+	serversurb map[peer.ID][]byte
 }
 
 type streamMessageSender struct {
@@ -95,6 +151,7 @@ type streamMessageSender struct {
 	connected bool
 	bsnet     *impl
 	opts      *MessageSenderOpts
+	dst       peer.ID
 }
 
 // Open a stream to the remote peer
@@ -205,7 +262,7 @@ func (s *streamMessageSender) send(ctx context.Context, msg bsmsg.BitSwapMessage
 	// (although usually we will already have connected - we only need to
 	// connect after a failed attempt to send)
 	timeout := s.opts.SendTimeout - time.Since(start)
-	if err = s.bsnet.msgToStream(ctx, stream, msg, timeout); err != nil {
+	if err = s.bsnet.msgToStream(ctx, stream, msg, timeout, s.dst); err != nil {
 		log.Infof("failed to send message to %s: %s", s.to, err)
 		return err
 	}
@@ -237,7 +294,7 @@ func (bsnet *impl) SupportsHave(proto protocol.ID) bool {
 	return true
 }
 
-func (bsnet *impl) msgToStream(ctx context.Context, s network.Stream, msg bsmsg.BitSwapMessage, timeout time.Duration) error {
+func (bsnet *impl) msgToStream(ctx context.Context, s network.Stream, msg bsmsg.BitSwapMessage, timeout time.Duration, p peer.ID) error {
 	deadline := time.Now().Add(timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -246,17 +303,72 @@ func (bsnet *impl) msgToStream(ctx context.Context, s network.Stream, msg bsmsg.
 	if err := s.SetWriteDeadline(deadline); err != nil {
 		log.Warnf("error setting deadline: %s", err)
 	}
-
+	log.Infof("Send Message: %v", msg.Wantlist())
 	// Older Bitswap versions use a slightly different wire format so we need
 	// to convert the message to the appropriate format depending on the remote
 	// peer's Bitswap version.
 	switch s.Protocol() {
+	case bsnet.protocolSphinx:
+		log.Infof("Sphinx send Message - to %v", s.Conn().RemotePeer())
+		data, err := msg.ToProtoV1().Marshal()
+		if err != nil {
+			log.Infof("error: %s", err)
+			return err
+		}
+		surbid := [16]byte{}
+		_, err = io.ReadFull(rand.Reader, surbid[:])
+		path, surbpath, err := bsnet.createPath(s.Conn().RemotePeer(), p, surbid)
+		if err != nil {
+			return err
+		}
+
+		geom := geo.GeometryFromUserForwardPayloadLength(bsnet.scheme, len(data), true, bsnet.nrHops)
+		sphinx := kpsphinx.NewNIKESphinx(bsnet.scheme, geom)
+
+		surb, key, err := sphinx.NewSURB(rand.Reader, surbpath)
+		if err != nil {
+			return err
+		}
+
+		bsnet.clientlk.Lock()
+		bsnet.surbmap[surbid] = key
+		bsnet.surbdest[surbid] = p
+		bsnet.clientlk.Unlock()
+
+		payload := make([]byte, 2, 2+geom.SURBLength+len(data))
+		payload[0] = 1
+		payload = append(payload, surb...)
+		payload = append(payload, data...)
+
+		pkt, err := sphinx.NewPacket(rand.Reader, path, []byte(payload))
+		if err != nil {
+			return err
+		}
+
+		size := len(pkt)
+
+		buf := pool.Get(size + binary.MaxVarintLen64)
+		defer pool.Put(buf)
+
+		n := binary.PutUvarint(buf, uint64(size))
+		copy(buf[n:], pkt[:])
+
+		n += len(pkt)
+
+		_, err = s.Write(buf[:n])
+		if err != nil {
+			log.Infof("Write error: %v", err)
+			return err
+		}
+		//log.Infof("Written: %v", written)
+
 	case bsnet.protocolBitswapOneOne, bsnet.protocolBitswap:
 		if err := msg.ToNetV1(s); err != nil {
 			log.Debugf("error: %s", err)
 			return err
 		}
 	case bsnet.protocolBitswapOneZero, bsnet.protocolBitswapNoVers:
+		log.Infof("Msg send.")
 		if err := msg.ToNetV0(s); err != nil {
 			log.Debugf("error: %s", err)
 			return err
@@ -276,13 +388,33 @@ func (bsnet *impl) msgToStream(ctx context.Context, s network.Stream, msg bsmsg.
 func (bsnet *impl) NewMessageSender(ctx context.Context, p peer.ID, opts *MessageSenderOpts) (MessageSender, error) {
 	opts = setDefaultOpts(opts)
 
-	sender := &streamMessageSender{
-		to:    p,
-		bsnet: bsnet,
-		opts:  opts,
+	var first peer.ID
+	if bsnet.nrHops == 1 {
+		first = p
+	} else {
+		for k := range bsnet.keys {
+			if k != bsnet.Self() {
+				if k == p {
+					continue
+				}
+				first = k
+				break
+			}
+		}
+	}
+	err := first.Validate()
+	if err != nil {
+		log.Infof("Could not determine first hop.")
 	}
 
-	err := sender.multiAttempt(ctx, func() error {
+	sender := &streamMessageSender{
+		to:    first,
+		bsnet: bsnet,
+		opts:  opts,
+		dst:   p,
+	}
+
+	err = sender.multiAttempt(ctx, func() error {
 		_, err := sender.Connect(ctx)
 		return err
 	})
@@ -323,21 +455,35 @@ func (bsnet *impl) SendMessage(
 	p peer.ID,
 	outgoing bsmsg.BitSwapMessage,
 ) error {
-	tctx, cancel := context.WithTimeout(ctx, connectTimeout)
-	defer cancel()
 
-	s, err := bsnet.newStreamToPeer(tctx, p)
-	if err != nil {
-		return err
+	bsnet.serverlk.RLock()
+	_, ok := bsnet.serversurb[p]
+	bsnet.serverlk.RUnlock()
+	if ok {
+		log.Infof("Sphinx Reply")
+		err := bsnet.reply(ctx, outgoing, p)
+		if err != nil {
+			log.Infof("Sphinx Reply Error: " + err.Error())
+			return err
+		}
+
+	} else {
+		tctx, cancel := context.WithTimeout(ctx, connectTimeout)
+		defer cancel()
+
+		s, err := bsnet.newStreamToPeer(tctx, p)
+		if err != nil {
+			return err
+		}
+
+		timeout := sendTimeout(outgoing.Size())
+		if err = bsnet.msgToStream(ctx, s, outgoing, timeout, s.Conn().RemotePeer()); err != nil {
+			_ = s.Reset()
+			return err
+		}
+		return s.Close()
 	}
-
-	timeout := sendTimeout(outgoing.Size())
-	if err = bsnet.msgToStream(ctx, s, outgoing, timeout); err != nil {
-		_ = s.Reset()
-		return err
-	}
-
-	return s.Close()
+	return nil
 }
 
 func (bsnet *impl) newStreamToPeer(ctx context.Context, p peer.ID) (network.Stream, error) {
@@ -410,25 +556,133 @@ func (bsnet *impl) handleNewStream(s network.Stream) {
 
 	reader := msgio.NewVarintReaderSize(s, network.MessageSizeMax)
 	for {
-		received, err := bsmsg.FromMsgReader(reader)
-		if err != nil {
-			if err != io.EOF {
-				_ = s.Reset()
-				for _, v := range bsnet.receivers {
-					v.ReceiveError(err)
+		if s.Protocol() == ProtocolSphinx {
+			data, err := reader.ReadMsg()
+			if err != nil {
+				if err != io.EOF {
+					_ = s.Reset()
+					for _, v := range bsnet.receivers {
+						v.ReceiveError(err)
+					}
+					log.Infof("bitswap net handleNewStream from %s error: %s", s.Conn().RemotePeer(), err)
 				}
-				log.Debugf("bitswap net handleNewStream from %s error: %s", s.Conn().RemotePeer(), err)
+				return
 			}
-			return
-		}
+			log.Infof("Sphinx Protocol - received.")
+			recv := make([]byte, len(data))
+			copy(recv[:], data[:])
 
-		p := s.Conn().RemotePeer()
-		ctx := context.Background()
-		log.Debugf("bitswap net handleNewStream from %s", s.Conn().RemotePeer())
-		bsnet.connectEvtMgr.OnMessage(s.Conn().RemotePeer())
-		atomic.AddUint64(&bsnet.stats.MessagesRecvd, 1)
-		for _, v := range bsnet.receivers {
-			v.ReceiveMessage(ctx, p, received)
+			pay, _, cmds, err := bsnet.recsphinx.Unwrap(bsnet.privk, data)
+
+			if err != nil {
+				log.Infof("Unwrap error: %v", err)
+			}
+			if len(cmds) > 0 && data[0] != 0 {
+				log.Infof("Packet false: %v", data)
+			}
+			reader.ReleaseMsg(recv)
+			log.Infof("%v, %v", s.Conn().RemotePeer().String(), len(cmds))
+			if len(cmds) == 0 {
+				log.Infof("No routingcommands: %v, payload: %v", len(cmds), pay)
+			}
+			if len(cmds) > 0 {
+				switch rcmd := cmds[0].(type) {
+				case *commands.NextNodeHop:
+					log.Infof("Forward - from: %v to %v", s.Conn().RemotePeer().String(), bsnet.nidpid[rcmd.ID].String())
+					err := bsnet.forward(context.Background(), data, rcmd)
+					if err != nil {
+						log.Infof("Forward error: %s", err.Error())
+						return
+					}
+					bsnet.connectEvtMgr.OnMessage(s.Conn().RemotePeer())
+					atomic.AddUint64(&bsnet.stats.MessagesRecvd, 1)
+
+				case *commands.Recipient:
+					log.Infof("Receipient Command")
+					if pay[0] == 1 {
+						msg, err := help(pay[(2 + bsnet.recsphinx.Geometry().SURBLength):])
+						if err != nil {
+							log.Infof("Error: pbmsg - bsmsg ")
+							return
+						}
+						length := bsnet.recsphinx.Geometry().SURBLength
+						//log.Infof("SURB Length: %v", length)
+						log.Infof("Msg: %v, %v, %v", msg.Wantlist(), msg.BlockPresences(), len(msg.Blocks()))
+						surb := pay[2 : length+2]
+						sum := [32]byte{}
+						_, err = io.ReadFull(rand.Reader, sum[:])
+						if err != nil {
+							log.Infof("Temp PID Error: %v", err.Error())
+						}
+						p := peer.ID(sum[:])
+						bsnet.serverlk.Lock()
+						bsnet.serversurb[p] = surb
+						bsnet.serverlk.Unlock()
+
+						ctx := context.Background()
+						bsnet.connectEvtMgr.OnMessage(s.Conn().RemotePeer())
+						atomic.AddUint64(&bsnet.stats.MessagesRecvd, 1)
+						for _, v := range bsnet.receivers {
+							v.ReceiveMessage(ctx, p, msg)
+						}
+					}
+				case *commands.SURBReply:
+					log.Infof("SURB command")
+					bsnet.clientlk.RLock()
+					deck, ok := bsnet.surbmap[rcmd.ID]
+					bsnet.clientlk.RUnlock()
+					if !ok {
+						return
+					}
+
+					pay, err := bsnet.recsphinx.DecryptSURBPayload(pay, deck)
+					if err != nil {
+						log.Infof("Surb decrypt error: " + err.Error())
+						return
+					}
+					msg, err := help(pay)
+					if err != nil {
+						log.Infof("Error: pbmsg - bsmsg ")
+						return
+					}
+					bsnet.clientlk.Lock()
+					p := bsnet.surbdest[rcmd.ID]
+					delete(bsnet.surbdest, rcmd.ID)
+					delete(bsnet.surbmap, rcmd.ID)
+					bsnet.clientlk.Unlock()
+					log.Infof("%v, %v, %v", msg.BlockPresences(), msg.Wantlist(), msg.Blocks())
+					ctx := context.Background()
+					for _, v := range bsnet.receivers {
+						v.ReceiveMessage(ctx, p, msg)
+					}
+
+				default:
+					fmt.Println("unknown")
+				}
+			}
+
+		} else {
+			log.Infof("Msg received")
+			received, err := bsmsg.FromMsgReader(reader)
+			if err != nil {
+				if err != io.EOF {
+					_ = s.Reset()
+					for _, v := range bsnet.receivers {
+						v.ReceiveError(err)
+					}
+					log.Debugf("bitswap net handleNewStream from %s error: %s", s.Conn().RemotePeer(), err)
+				}
+				return
+			}
+
+			p := s.Conn().RemotePeer()
+			ctx := context.Background()
+			log.Debugf("bitswap net handleNewStream from %s", s.Conn().RemotePeer())
+			bsnet.connectEvtMgr.OnMessage(s.Conn().RemotePeer())
+			atomic.AddUint64(&bsnet.stats.MessagesRecvd, 1)
+			for _, v := range bsnet.receivers {
+				v.ReceiveMessage(ctx, p, received)
+			}
 		}
 	}
 }
@@ -442,6 +696,72 @@ func (bsnet *impl) Stats() Stats {
 		MessagesRecvd: atomic.LoadUint64(&bsnet.stats.MessagesRecvd),
 		MessagesSent:  atomic.LoadUint64(&bsnet.stats.MessagesSent),
 	}
+}
+
+func (bsnet *impl) createPath(first peer.ID, dst peer.ID, surbid [16]byte) ([]*kpsphinx.PathHop, []*kpsphinx.PathHop, error) {
+	if len(bsnet.keys) < bsnet.nrHops {
+		return nil, nil, fmt.Errorf("Not enough keys")
+	}
+	var path []*kpsphinx.PathHop
+	var retpath []*kpsphinx.PathHop
+
+	if bsnet.nrHops > 1 {
+		fh := &kpsphinx.PathHop{}
+		farr, _ := first.MarshalBinary()
+		copy(fh.ID[:], farr[:])
+		fh.NIKEPublicKey = bsnet.keys[first]
+		path = append(path, fh)
+
+		for k, e := range bsnet.keys {
+			if k == dst || k == bsnet.host.ID() || k == first {
+				continue
+			}
+			if len(path)+1 >= bsnet.nrHops {
+				break
+			}
+			hop := &kpsphinx.PathHop{}
+			barr, _ := k.MarshalBinary()
+			copy(hop.ID[:], barr[:])
+			hop.NIKEPublicKey = e
+
+			path = append(path, hop)
+		}
+		for k, e := range bsnet.keys {
+			if k == dst || k == bsnet.host.ID() {
+				continue
+			}
+			if len(retpath)+1 >= bsnet.nrHops {
+				break
+			}
+			hop := &kpsphinx.PathHop{}
+			barr, _ := k.MarshalBinary()
+			copy(hop.ID[:], barr[:])
+			hop.NIKEPublicKey = e
+
+			retpath = append(retpath, hop)
+		}
+	}
+
+	hop := &kpsphinx.PathHop{}
+	dstarr, _ := dst.MarshalBinary()
+	copy(hop.ID[:], dstarr[:])
+	hop.NIKEPublicKey = bsnet.keys[dst]
+	recipCmd := &commands.Recipient{}
+	copy(recipCmd.ID[:], dstarr[:])
+	hop.Commands = append(hop.Commands, recipCmd)
+	path = append(path, hop)
+
+	selfid := bsnet.Self()
+	self := &kpsphinx.PathHop{}
+	selfarr, _ := selfid.MarshalBinary()
+	copy(self.ID[:], selfarr[:])
+	self.NIKEPublicKey = bsnet.pubk
+	surbCmd := &commands.SURBReply{}
+	surbCmd.ID = surbid
+	self.Commands = append(self.Commands, surbCmd)
+	retpath = append(retpath, self)
+
+	return path, retpath, nil
 }
 
 type netNotifiee impl
@@ -471,3 +791,177 @@ func (nn *netNotifiee) OpenedStream(n network.Network, s network.Stream) {}
 func (nn *netNotifiee) ClosedStream(n network.Network, v network.Stream) {}
 func (nn *netNotifiee) Listen(n network.Network, a ma.Multiaddr)         {}
 func (nn *netNotifiee) ListenClose(n network.Network, a ma.Multiaddr)    {}
+
+func (bsnet *impl) reply(ctx context.Context, msg bsmsg.BitSwapMessage, p peer.ID) error {
+	bsnet.serverlk.RLock()
+	surb := bsnet.serversurb[p]
+	bsnet.serverlk.RUnlock()
+	payload, err := msg.ToProtoV1().Marshal()
+	if err != nil {
+		return err
+	}
+	pkt, nid, err := bsnet.recsphinx.NewPacketFromSURB(surb, payload)
+	if err != nil {
+		return err
+	}
+	pid := bsnet.nidpid[*nid]
+
+	bsnet.serverlk.Lock()
+	delete(bsnet.serversurb, p)
+	bsnet.serverlk.Unlock()
+
+	tctx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+
+	s, err := bsnet.newStreamToPeer(tctx, pid)
+	if err != nil {
+		return err
+	}
+
+	err = bsnet.pktwrite(tctx, pkt, s)
+	if err != nil {
+		log.Infof("Reply Error: %s", err)
+		return err
+	}
+
+	log.Infof("Reply success.")
+
+	return nil
+}
+
+func (bsnet *impl) forward(ctx context.Context, pkt []byte, cmd *commands.NextNodeHop) error {
+
+	pid := bsnet.nidpid[cmd.ID]
+
+	tctx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+
+	s, err := bsnet.newStreamToPeer(tctx, pid)
+	if err != nil {
+		log.Infof("Stream error:%s", err)
+		return err
+	}
+
+	err = bsnet.pktwrite(tctx, pkt, s)
+	if err != nil {
+		log.Infof("Forward Error: %s", err)
+		return err
+	}
+	log.Infof("Forward success.")
+
+	return nil
+}
+
+func (bsnet *impl) pktwrite(ctx context.Context, pkt []byte, s network.Stream) error {
+
+	timeout := sendTimeout(len(pkt))
+
+	deadline := time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+
+	if err := s.SetWriteDeadline(deadline); err != nil {
+		log.Warnf("error setting deadline: %s", err)
+	}
+
+	size := len(pkt)
+
+	buf := pool.Get(size + binary.MaxVarintLen64)
+	defer pool.Put(buf)
+
+	n := binary.PutUvarint(buf, uint64(size))
+	copy(buf[n:], pkt[:])
+	n += size
+
+	_, err := s.Write(buf[:n])
+	if err != nil {
+		log.Infof("Write error")
+		return err
+	}
+
+	atomic.AddUint64(&bsnet.stats.MessagesSent, 1)
+
+	if err := s.SetWriteDeadline(time.Time{}); err != nil {
+		log.Warnf("error resetting deadline: %s", err)
+	}
+
+	return s.Close()
+
+}
+
+func help(data []byte) (bsmsg.BitSwapMessage, error) {
+
+	pbmsg := bitswap_message_pb.Message{}
+	pbmsg.Unmarshal(data)
+	msg := bsmsg.New(pbmsg.Wantlist.Full)
+	for _, e := range pbmsg.Wantlist.Entries {
+		msg.AddEntry(e.Block.Cid, e.Priority, e.WantType, e.SendDontHave)
+	}
+	for _, e := range pbmsg.Blocks {
+		b := blocks.NewBlock(e)
+		msg.AddBlock(b)
+	}
+	for _, e := range pbmsg.GetPayload() {
+		pref, err := cid.PrefixFromBytes(e.GetPrefix())
+		if err != nil {
+			return nil, err
+		}
+
+		c, err := pref.Sum(e.GetData())
+		if err != nil {
+			return nil, err
+		}
+
+		blk, err := blocks.NewBlockWithCid(e.GetData(), c)
+		if err != nil {
+			return nil, err
+		}
+
+		msg.AddBlock(blk)
+	}
+	for _, bi := range pbmsg.GetBlockPresences() {
+		if !bi.Cid.Cid.Defined() {
+			return nil, errors.New("missing cid")
+		}
+		msg.AddBlockPresence(bi.Cid.Cid, bi.Type)
+	}
+
+	return msg, nil
+}
+
+func (bsnet *impl) UpdatePubKeys(keys map[peer.ID]nike.PublicKey) {
+	bsnet.nidpid = make(map[[32]byte]peer.ID)
+	for k := range keys {
+		karr, err := k.MarshalBinary()
+		if err != nil {
+			log.Infof("UpdatePubKeys: " + err.Error())
+		}
+		var nid [32]byte
+		copy(nid[:], karr[:])
+		bsnet.nidpid[nid] = k
+	}
+	bsnet.keys = keys
+	log.Infof("%v new Pubkeys", len(keys))
+}
+
+func (bsnet *impl) GetNikeKey() nike.PublicKey {
+	return bsnet.pubk
+}
+
+func (bsnet *impl) SetNikeKey(priv nike.PrivateKey, pub nike.PublicKey) {
+	bsnet.privk = priv
+	bsnet.pubk = pub
+	return
+}
+
+func (bsnet *impl) Scheme() nike.Scheme {
+	return bsnet.scheme
+}
+
+func (bsnet *impl) SetHops(hops int) {
+	bsnet.nrHops = hops
+	geom := geo.GeometryFromUserForwardPayloadLength(bsnet.scheme, 512, true, hops)
+	sphinx := kpsphinx.NewNIKESphinx(bsnet.scheme, geom)
+	bsnet.recsphinx = sphinx
+}
