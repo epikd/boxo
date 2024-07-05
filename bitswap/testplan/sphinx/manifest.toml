@@ -1,0 +1,33 @@
+name = "sphinx"
+
+[defaults]
+builder = "exec:go"
+runner = "local:exec"
+
+[builders."docker:go"]
+enabled = true
+build_base_image = "golang:1.22.3-bookworm"
+
+[builders."exec:go"]
+enabled = true
+
+[runners."local:docker"]
+enabled = true
+
+[runners."local:exec"]
+enabled = true
+
+[runners."cluster:swarm"]
+enabled = true
+
+[runners."cluster:k8s"]
+enabled = true
+
+[[testcases]]
+  name = "speed-test"
+  instances = { min = 3, max = 100, default = 3 }
+
+    [testcases.params]
+      size = { type = "int", desc = "size of file to transfer, in human-friendly form", default = "1MiB" }
+      count = { type = "int", desc = "number of transfers", default = "10" }
+      hops = { type = "int", desc = "number of nodes between client and provider", default = "2" }
